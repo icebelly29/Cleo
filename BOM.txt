@@ -1,0 +1,9 @@
+1) Arduino Uno Q 2GB variant
+2) L293D Motor Driver/Servo Shield for Arduino
+3) VL53L0X Laser ToF Distance Ranging Sensor
+4) DC5V 5015 Oil Containing Cooling Fan with XH2.54- 2P 12CM Cable Size:50*50*15MM
+5) MINI 3PI Car N20 Caster Robot Ball Wheel, Small Robotics Wheel
+6) 2* 43–75 RPM Strong Magnet BO Motor – Single Shaft with Rubber wheels
+7) TowerPro SG90 Mini Servo - 180 degree Rotation - Standard Quality
+8) 2* DMEGC INR18650-26E 3.7V 2600mAh Li-Ion Battery
+9) 2 x 18650 BLM Cell Box with Wire without Cover with On/Off Switch
