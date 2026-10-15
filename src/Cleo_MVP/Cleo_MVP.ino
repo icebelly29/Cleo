@@ -56,6 +56,12 @@ void runMotor(int motor, int command, int speed) {
   else if (motor == 3) { a = MOTOR3_A; b = MOTOR3_B; pwm = MOTOR3_PWM; }
   else return;
 
+  // Invert direction for drive motors 1 and 2 to match wiring polarity
+  if (motor == 1 || motor == 2) {
+    if (command == FORWARD) command = BACKWARD;
+    else if (command == BACKWARD) command = FORWARD;
+  }
+
   if (command == FORWARD) {
     latch_state |= (1 << a);
     latch_state &= ~(1 << b);
@@ -94,72 +100,20 @@ bool suctionEnabled = true;
 // State Machine for Autonomous Mode
 enum RobotState { 
   STATE_DRIVING, 
-  STATE_STOPPING, 
-  STATE_TURNING, 
-  STATE_INVESTIGATIVE_ARC,
-  STATE_FRUSTRATED_SHAKE,
-  STATE_STUCK_SHUTDOWN
+  STATE_REVERSING
 };
 RobotState currentState = STATE_DRIVING;
 unsigned long stateStartTime = 0;
-int animationStep = 0;
-
-// Anomaly Detection (TinyML) Data
-const int HISTORY_SIZE = 20;
-int distanceHistory[HISTORY_SIZE];
-int historyIndex = 0;
-bool historyFull = false;
-unsigned long lastHistoryUpdate = 0;
-unsigned long lastStuckTime = 0;
-const unsigned long STUCK_COOLDOWN = 15000;
-
-void clearHistory() {
-  historyFull = false;
-  historyIndex = 0;
-}
-
-void addDistanceToHistory(int distance) {
-  if (millis() - lastHistoryUpdate > 500) {
-    distanceHistory[historyIndex] = distance;
-    historyIndex++;
-    if (historyIndex >= HISTORY_SIZE) {
-      historyIndex = 0;
-      historyFull = true;
-    }
-    lastHistoryUpdate = millis();
-  }
-}
-
-bool isRobotStuck() {
-  if (!historyFull) return false;
-  // Cooldown: do not trigger if a stuck event occurred recently
-  if (millis() - lastStuckTime < STUCK_COOLDOWN) return false;
-  
-  int minDist = 9999;
-  int maxDist = 0;
-  for (int i=0; i<HISTORY_SIZE; i++) {
-    if (distanceHistory[i] < minDist) minDist = distanceHistory[i];
-    if (distanceHistory[i] > maxDist) maxDist = distanceHistory[i];
-  }
-  
-  // Anomaly: If variance over 10 seconds is less than 50mm, the robot is stuck
-  return (maxDist - minDist < 50);
-}
-
+const unsigned long MIN_REVERSE_DURATION = 1200; // Milliseconds to reverse upon obstacle
 
 // RPC Wrapper Functions
 void rpcToggleMode() {
   autonomousMode = !autonomousMode;
   if (autonomousMode) {
-    clearHistory();
-    lastStuckTime = millis();
     currentState = STATE_DRIVING;
     stateStartTime = millis();
-    animationStep = 0;
     driveForward();
   } else {
-    currentState = STATE_DRIVING;
-    animationStep = 0;
     stopMotors();
   }
 }
@@ -170,25 +124,36 @@ void rpcToggleSuction() {
   else runMotor(3, RELEASE, 0);
 }
 
-void rpcForward() { if (!autonomousMode) driveForward(); }
-void rpcReverse() { if (!autonomousMode) driveReverse(); }
-void rpcLeft() { if (!autonomousMode) turnLeft(); }
-void rpcRight() { if (!autonomousMode) turnRight(); }
-void rpcStop() { if (!autonomousMode) stopMotors(); }
+void rpcForward() { autonomousMode = false; driveForward(); }
+void rpcReverse() { autonomousMode = false; driveReverse(); }
+void rpcLeft() { autonomousMode = false; turnLeft(); }
+void rpcRight() { autonomousMode = false; turnRight(); }
+void rpcForwardLeft() { autonomousMode = false; driveForwardLeft(); }
+void rpcForwardRight() { autonomousMode = false; driveForwardRight(); }
+void rpcReverseLeft() { autonomousMode = false; driveReverseLeft(); }
+void rpcReverseRight() { autonomousMode = false; driveReverseRight(); }
+void rpcStop() { autonomousMode = false; stopMotors(); }
 
 void rpcTestShake() {
+  autonomousMode = false;
   stopMotors();
-  autonomousMode = true;
-  currentState = STATE_FRUSTRATED_SHAKE;
-  stateStartTime = millis();
+  for (int i = 0; i < 4; i++) {
+    panServo.write(45);
+    delay(150);
+    panServo.write(135);
+    delay(150);
+  }
+  panServo.write(90);
 }
 
 void rpcTestArc() {
+  autonomousMode = false;
   stopMotors();
-  autonomousMode = true;
-  currentState = STATE_INVESTIGATIVE_ARC;
-  stateStartTime = millis();
-  animationStep = 0;
+  panServo.write(45);
+  delay(400);
+  panServo.write(135);
+  delay(400);
+  panServo.write(90);
 }
 
 void setup() {
@@ -202,6 +167,10 @@ void setup() {
   Bridge.provide("reverse", rpcReverse);
   Bridge.provide("left", rpcLeft);
   Bridge.provide("right", rpcRight);
+  Bridge.provide("forward_left", rpcForwardLeft);
+  Bridge.provide("forward_right", rpcForwardRight);
+  Bridge.provide("reverse_left", rpcReverseLeft);
+  Bridge.provide("reverse_right", rpcReverseRight);
   Bridge.provide("stop", rpcStop);
   Bridge.provide("test_shake", rpcTestShake);
   Bridge.provide("test_arc", rpcTestArc);
@@ -245,98 +214,40 @@ void updateServo() {
 void runAutonomousLogic() {
   unsigned long now = millis();
 
-  // Read distance
+  // Continuously scan the area with the servo
+  updateServo();
+
+  // Read distance from Time-of-Flight sensor
   VL53L0X_RangingMeasurementData_t measurement;
   lox.rangingTest(&measurement, false);
   int distance = (measurement.RangeStatus != 4) ? measurement.RangeMilliMeter : 8190;
 
   switch (currentState) {
     case STATE_DRIVING:
-      updateServo();
-      addDistanceToHistory(distance);
-
-      // AI Anomaly Detection: Are we stuck?
-      if (isRobotStuck()) {
-        stopMotors();
-        lastStuckTime = now;
-        currentState = STATE_FRUSTRATED_SHAKE;
-        stateStartTime = now;
-        break;
-      }
-
-      // Standard Obstacle Avoidance
+      // Drive forward by default
       if (distance <= obstacleThreshold) {
-        stopMotors();
-        currentState = STATE_STOPPING;
+        // Only drive back when met with an obstacle
+        driveReverse();
+        currentState = STATE_REVERSING;
         stateStartTime = now;
+      } else {
+        driveForward();
       }
       break;
 
-    case STATE_STOPPING:
-      if (now - stateStartTime >= 100) {
-        currentState = STATE_INVESTIGATIVE_ARC;
-        stateStartTime = now;
-        animationStep = 0;
-      }
-      break;
-
-    case STATE_INVESTIGATIVE_ARC:
-      // Organic Personality: Cautiously backup and look around
-      if (animationStep == 0) {
-        runMotor(1, BACKWARD, 255);
-        runMotor(2, BACKWARD, 255);
-        panServo.write(45);
-        animationStep = 1;
-      } else if (animationStep == 1 && now - stateStartTime >= 400) {
-        panServo.write(135);
-        animationStep = 2;
-      } else if (animationStep == 2 && now - stateStartTime >= 800) {
-        panServo.write(90);
-        if (servoPos < 90) turnLeft();
-        else turnRight();
-        currentState = STATE_TURNING;
-        stateStartTime = now;
-      }
-      break;
-
-    case STATE_TURNING:
-      if (now - stateStartTime >= 500) {
-        panServo.write(90);
-        servoPos = 90;
-        clearHistory(); // Reset anomaly history
+    case STATE_REVERSING:
+      // Drive back until the minimum duration passes AND the obstacle is clear
+      if ((now - stateStartTime >= MIN_REVERSE_DURATION) && (distance > obstacleThreshold + 50)) {
         driveForward();
         currentState = STATE_DRIVING;
-      }
-      break;
-
-    case STATE_FRUSTRATED_SHAKE:
-      // Organic Personality: Rapid wiggle to show frustration
-      if (now - stateStartTime < 1500) {
-        // Servo-only shake: BO motors stay off
-        stopMotors();
-        int shakeCycle = ((now - stateStartTime) / 150) % 2;
-        if (shakeCycle == 0) {
-          panServo.write(45);
-        } else {
-          panServo.write(135);
-        }
-      } else if (now - stateStartTime < 2500) {
-        // Phase 2: Reverse for 1 second to clear the obstacle
-        panServo.write(90);
-        driveReverse();
       } else {
-        // Phase 3: Turn and resume
-        servoPos = 90;
-        turnRight();
-        currentState = STATE_TURNING;
-        stateStartTime = now;
-        clearHistory();
+        driveReverse();
       }
       break;
 
-    case STATE_STUCK_SHUTDOWN:
-      // Fallback: sweep servo and wait for user rescue via Web UI
-      updateServo();
+    default:
+      currentState = STATE_DRIVING;
+      driveForward();
       break;
   }
 }
@@ -356,6 +267,22 @@ void turnRight() {
 void turnLeft() {
   runMotor(1, BACKWARD, 255);
   runMotor(2, FORWARD, 255);
+}
+void driveForwardRight() {
+  runMotor(1, FORWARD, 255);
+  runMotor(2, RELEASE, 0);
+}
+void driveForwardLeft() {
+  runMotor(1, RELEASE, 0);
+  runMotor(2, FORWARD, 255);
+}
+void driveReverseRight() {
+  runMotor(1, BACKWARD, 255);
+  runMotor(2, RELEASE, 0);
+}
+void driveReverseLeft() {
+  runMotor(1, RELEASE, 0);
+  runMotor(2, BACKWARD, 255);
 }
 void stopMotors() {
   runMotor(1, RELEASE, 0);
